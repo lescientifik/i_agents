@@ -75,3 +75,107 @@ Takeaways pertinents pour nos designs:
 - Mémoire/handoff: peu détaillé dans ce post, mais insiste sur "ground truth from the environment at each step" -> ne pas compter sur la mémoire LLM, re-lire les fichiers.
 - Philosophie: "start simple, add agentic complexity only when simpler solutions fall short". Donc notre self-reset devrait être désactivable pour des tâches courtes.
 
+### 3. Cognition "Don't build multi-agents"
+
+Thèse: les architectures multi-agents sont fondamentalement peu fiables en prod. Préférer un agent **single-threaded** avec context management robuste.
+
+Deux principes énoncés:
+1. "Share context, and share full agent traces, not just individual messages"
+2. "Actions carry implicit decisions, and conflicting decisions carry bad results"
+
+Failure mode illustratif: Flappy Bird - subagent 1 fait un background style Super Mario, subagent 2 fait un bird sprite incompatible, l'agent final hérite d'un merge impossible. Les décisions se dispersent quand le contexte n'est pas partagé.
+
+Recommandation pour les tâches longues: **introduire un LLM spécialisé dans la compression de l'historique** en "key decisions and events" avant que la window sature. C'est exactement le pattern /compact de Claude Code, et c'est exactement ce que vise notre Design A.
+
+Implication directe pour nous:
+- Préférer un seul agent qui se reset plutôt qu'un orchestrateur qui spawn des subagents parallèles.
+- Si on doit faire du sub-agent, partager le trace complet, pas juste un message.
+- Le self-reset doit préserver les "key decisions" et pas seulement les fichiers bruts - d'où la note textuelle associée.
+
+### 4. MemGPT / Letta (arxiv 2310.08560)
+
+Métaphore OS: mémoire hiérarchique comme RAM/disk. L'agent gère sa propre mémoire via tool calls.
+
+**3 tiers de mémoire**:
+- **Core memory** (in-context, taille fixe): blocs édités par l'agent via tools, pinned dans la window. Persona, user facts, current task. Analogue RAM.
+- **Recall memory**: historique complet des interactions, persisté sur disque, searchable via text/date tools. L'historique raw quoi.
+- **Archival memory**: knowledge structuré externe (vector DB, graph DB). Agent y écrit explicitement via tools read/write.
+
+**Tools par défaut exposés à l'agent**:
+- `core_memory_append`, `core_memory_replace` (édition in-context)
+- `archival_memory_insert`, `archival_memory_search` (DB externe)
+- `conversation_search`, `conversation_search_date` (recall memory)
+
+**Control flow**: interrupts. Quand le contexte sature, un heartbeat événement interrompt l'agent pour qu'il déplace des choses core->archival.
+
+Pour nous: Letta confirme qu'il est OK de donner des tools de gestion mémoire à l'agent. Mais leur modèle est complexe (3 tiers). Pour notre cas **code agent**, on peut simplifier: le "archival" est remplacé par **le filesystem lui-même** (les fichiers du projet sont la mémoire externe naturelle). Donc self-reset = "re-injecte ces fichiers + cette note" suffit, pas besoin d'un vector store.
+
+### 5. Aider repo map
+
+Pipeline:
+1. Tree-sitter parse tous les fichiers (130+ langages), extrait definitions/references via `tags.scm`.
+2. Construit un graphe dirigé: noeuds = fichiers, arêtes = dépendances (X définit, Y référence).
+3. **Personalized PageRank** où le "bias" initial pointe vers les fichiers actuellement mentionnés dans la conversation.
+4. Top-ranked definitions rendues en vue "elided" (signatures uniquement, corps cachés) jusqu'à saturer un token budget.
+
+Points clefs:
+- Automatique, pas besoin pour l'user de choisir les fichiers.
+- Mis à jour à chaque tour (PageRank personalized selon la conversation courante).
+- Cache par mtime pour les tags, fast.
+- ~15B tokens/semaine processés.
+
+Pour nos designs:
+- Intéressant comme **fallback automatique** quand l'agent ne précise pas les files à reset.
+- Mais pour notre Design A, on privilégie le **choix explicite** par l'agent (il sait quels fichiers sont load-bearing pour la suite de sa tâche). Le repo map peut être un tool auxiliaire `get_repo_map()` que l'agent peut appeler avant de décider du reset.
+- Le rendu "elided" (signatures only) est une bonne optimisation: on peut injecter les signatures au lieu du contenu complet pour des fichiers "context" vs les fichiers "actif".
+
+### 6. "Context handoff" / "baton passing" pattern
+
+Terme le plus courant: **"handoff"** (OpenAI Agents SDK, LangChain, AG2, LiveKit l'utilisent tous). "Baton passing" est plus informel.
+
+Implémentations types:
+- **OpenAI Agents SDK**: handoff représenté comme un tool `transfer_to_<agent_name>`. Option `input_filter` pour forwarder seulement un subset.
+- **LangChain**: handoffs dans multi-agent setups, agent reçoit soit la conv complète, soit filtrée, soit résumée.
+- **AG2 / LiveKit**: pattern "Agent Transfer" où sub-agent hérite d'une vue sur la Session.
+
+Design considerations reported:
+- Forwarder la conv complète au receiving agent est souvent mauvais: pollution par reasoning interne, coût tokens.
+- Recommandation: **résumer avant handoff** si la conv est longue.
+- Par défaut beaucoup d'implems démarrent le receiving agent avec un contexte frais.
+
+Pour notre self-reset (qui est un handoff "à soi-même du futur"):
+- Suivre le pattern **tool-as-handoff** (tool call `prepare_reset` vu comme un transfer_to_self).
+- Filtrer agressivement: on garde seulement files + note résumé + prompt système. **Pas** l'historique des tool calls.
+- Analogue conceptuel: c'est une handoff vers un sub-agent qui s'appelle "moi mais demain matin".
+
+### 7. Claude Code subagents (context passing)
+
+Findings pertinents pour Design A:
+- Le subagent démarre avec un **contexte frais**, zéro historique du parent.
+- **Unique canal parent -> subagent**: la string prompt passée au tool `Agent`/`Task`. Le coordinator doit mettre dedans: file paths, error messages, decisions nécessaires.
+- **Unique canal subagent -> parent**: le message final. Les tool calls intermédiaires et leurs results restent internes au subagent.
+- Tool permissions au subagent: explicitement granted, subset du parent.
+- Invocation: soit implicite (match sur description), soit explicite par nom, soit `@mention`.
+- Context isolation complète: parent ne voit pas le raisonnement interne, subagent ne voit pas l'historique parent.
+
+Analogie directe avec notre self-reset:
+- Notre `prepare_reset(files, note)` = équivalent de créer un subagent "future-self" avec:
+  - prompt initial = `note` (+ system prompt standard)
+  - "pre-granted context" = contenu des `files`
+  - continuation de la session = return du subagent (sauf que chez nous, c'est la session principale qui continue, pas le parent qui reprend)
+- La leçon: un subagent frais avec juste un prompt bien écrit + les fichiers pertinents **fonctionne en pratique** dans Claude Code. Donc notre pari est plausible.
+
+### 8. OpenAI Codex CLI - resume & /compact
+
+Findings:
+- **Sessions auto-sauvegardées** en **JSONL** dans `~/.codex/sessions/YYYY/MM/DD/`. Transcript complet persisté sans config.
+- Commande `codex resume` ouvre un picker des sessions récentes (scope: cwd par défaut, `--all` pour toutes).
+- Commande `/compact` (inline): résume la conv et remplace les earlier turns par le résumé. Free du contexte tout en gardant les détails critiques.
+- Extended tasks: Codex peut tourner jusqu'à **7h en continu** en auto-compactant quand la window sature.
+- `--cd` et `--add-dir` pour ajouter des racines de working dir avant resume.
+
+Pour nos designs:
+- **JSONL per-session sous un dossier daté** = bon pattern pour notre Design C (trace log).
+- Le pattern "auto-compact on limit" confirme que c'est mainstream en 2025-2026 et que les utilisateurs attendent de la continuité.
+- Resume = reload une session sauvée avec le même état repo. Différent de notre self-reset (qui *nettoie* le contexte volontairement), mais le mécanisme de sérialisation est similaire.
+
